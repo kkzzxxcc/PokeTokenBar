@@ -209,6 +209,43 @@ enum LocalUsageReader {
     static var codexSessionsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
     }
+
+    /// Codex usage roots discovered for the current refresh. In addition to the regular
+    /// CODEX_HOME, OpenClaw gives every agent an independent CODEX_HOME beneath
+    /// `~/.openclaw/agents/<agent-id>/agent/codex-home`.
+    ///
+    /// This is intentionally not cached: agents may be added while PokeTokenBar is running.
+    static var codexSessionRoots: [URL] { computeCodexSessionRoots() }
+
+    /// Pure-ish discovery entry point used by tests with an isolated home directory.
+    static func computeCodexSessionRoots(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        fileManager: FileManager = .default
+    ) -> [URL] {
+        var roots: [URL] = []
+
+        func appendIfDirectory(_ url: URL) {
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                roots.append(url)
+            }
+        }
+
+        appendIfDirectory(home.appendingPathComponent(".codex/sessions"))
+
+        let agents = home.appendingPathComponent(".openclaw/agents")
+        if let agentDirectories = try? fileManager.contentsOfDirectory(
+            at: agents,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for agent in agentDirectories {
+                appendIfDirectory(agent.appendingPathComponent("agent/codex-home/sessions"))
+            }
+        }
+
+        return normalizedRoots(roots)
+    }
     static var geminiTmpDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/tmp")
     }
@@ -570,9 +607,14 @@ enum LocalUsageReader {
         return (Array(rolloutsByPath.values), includedPaths)
     }
 
-    static func codexEntries(modifiedSince: Date, root: URL? = nil) -> [Entry] {
+    static func codexEntries(
+        modifiedSince: Date,
+        root: URL? = nil,
+        roots: [URL]? = nil
+    ) -> [Entry] {
         let fmt = localDayFormatter()
-        let allFiles = codexRolloutFiles(in: root ?? codexSessionsDir)
+        let selectedRoots = normalizedRoots(roots ?? root.map { [$0] } ?? codexSessionRoots)
+        let allFiles = selectedRoots.flatMap(codexRolloutFiles(in:))
         // 테스트/캐시 미사용 경로 — 아는 세션 id 가 없으니 파일명 힌트와 probe 만으로 부모를 찾는다.
         let (rollouts, includedPaths) = expandCodexParentClosure(
             windowFiles: allFiles.filter { $0.mtime >= modifiedSince },

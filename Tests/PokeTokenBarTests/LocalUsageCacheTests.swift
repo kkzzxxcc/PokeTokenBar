@@ -98,6 +98,77 @@ final class LocalUsageCacheTests: XCTestCase {
         """
     }
 
+    private func makeCodexRoot(_ relativePath: String) throws -> URL {
+        let url = root.deletingLastPathComponent().appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func writeCodexFile(
+        root codexRoot: URL,
+        name: String,
+        sessionID: String,
+        input: Int = 100,
+        output: Int = 10
+    ) throws {
+        let lines = [
+            sessionMeta(id: sessionID, ts: "2026-07-29T01:00:00.000Z"),
+            codexStateLine(ts: "2026-07-29T01:00:01.000Z",
+                           cumulativeInput: input, cumulativeOutput: output,
+                           lastInput: input, lastOutput: output),
+        ]
+        try lines.joined(separator: "\n").write(
+            to: codexRoot.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    func testCodexRootDiscoveryWithoutOpenClaw() throws {
+        let home = try makeCodexRoot("home-no-openclaw")
+        let cli = home.appendingPathComponent(".codex/sessions")
+        try FileManager.default.createDirectory(at: cli, withIntermediateDirectories: true)
+
+        XCTAssertEqual(LocalUsageReader.computeCodexSessionRoots(home: home).map(\.path), [cli.path])
+    }
+
+    func testCodexRootDiscoveryWithOnlyOpenClawAndArbitraryAgentName() throws {
+        let home = try makeCodexRoot("home-openclaw-only")
+        let sessions = home.appendingPathComponent(
+            ".openclaw/agents/my-future-agent/agent/codex-home/sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+
+        XCTAssertEqual(LocalUsageReader.computeCodexSessionRoots(home: home).map(\.path), [sessions.path])
+    }
+
+    func testCodexRootDiscoveryFindsCLIAndMultipleOpenClawAgents() throws {
+        let home = try makeCodexRoot("home-all-roots")
+        let expected = [
+            home.appendingPathComponent(".codex/sessions"),
+            home.appendingPathComponent(".openclaw/agents/personal-mac/agent/codex-home/sessions"),
+            home.appendingPathComponent(".openclaw/agents/ios-dev/agent/codex-home/sessions"),
+        ]
+        for url in expected {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+
+        XCTAssertEqual(Set(LocalUsageReader.computeCodexSessionRoots(home: home).map(\.path)),
+                       Set(expected.map(\.path)))
+    }
+
+    func testCodexMultipleRootsAreAggregatedWithoutDuplicateSession() async throws {
+        let cli = try makeCodexRoot("codex-cli")
+        let openClawA = try makeCodexRoot("openclaw-a")
+        let openClawB = try makeCodexRoot("openclaw-b")
+        try writeCodexFile(root: cli, name: "rollout-shared.jsonl", sessionID: "shared")
+        try writeCodexFile(root: openClawA, name: "rollout-shared-copy.jsonl", sessionID: "shared")
+        try writeCodexFile(root: openClawB, name: "rollout-unique.jsonl", sessionID: "unique",
+                           input: 200, output: 20)
+
+        let cache = LocalUsageCache(codexRoots: [cli, openClawA, openClawB], fileURL: cacheFile)
+        let entries = await cache.codexEntries(modifiedSince: since)
+
+        XCTAssertEqual(entries.count, 2, "복제된 동일 session은 한 번만 집계해야 한다")
+        XCTAssertEqual(entries.reduce(0) { $0 + $1.total }, 330)
+    }
+
     private func forkedCodexLines() -> [String] {
         [
             forkedSessionMeta(ts: "2026-07-29T01:00:00.000Z"),
