@@ -6,6 +6,7 @@ private enum LocalAdditionalSource: String, Sendable {
     case hermes
     case cursor
     case copilot
+    case kiro
 }
 
 /// OpenCode usage from its local SQLite database and legacy message files.
@@ -75,6 +76,35 @@ struct LocalCopilotProvider: UsageProvider {
     }
 }
 
+/// Kiro CLI usage estimated from its local conversation-history database.
+///
+/// Kiro's `RequestMetadata` (verified against `aws/amazon-q-developer-cli`, the upstream
+/// kiro-cli forks) never persists a token count. Tokens here are a bytes/4 estimate built
+/// from the stored conversation text — see `kiroTurnEntries` for why the ready-made
+/// `user_prompt_length` field can't be used as-is. There is no real dollar figure to
+/// report on top of an estimate (`reportsCost = false`, same reasoning as Copilot).
+///
+/// Kiro also *deletes* turns from its database on `/clear` or compaction (unlike every other
+/// local source here, whose on-disk logs only grow), so this provider merges each scan with
+/// previously-seen entries — see the `.kiro` case in `LocalAdditionalUsageCache`. A cleared
+/// conversation's already-counted tokens stay counted for the rest of the app's process
+/// lifetime, but are lost like any other in-memory cache on the next app restart.
+struct LocalKiroProvider: UsageProvider {
+    let id = "kiro"
+    let displayName = "Kiro"
+    let reportsCost = false
+
+    func fetchDaily() async throws -> DailyUsage? {
+        let entries = await LocalAdditionalUsageCache.shared.entries(for: .kiro)
+        return LocalUsageReader.daily(entries: entries, localDay: LocalUsageReader.todayKey())
+    }
+
+    func fetchEnrichment() async -> ProviderEnrichment {
+        let entries = await LocalAdditionalUsageCache.shared.entries(for: .kiro)
+        return enrichment(entries: entries)
+    }
+}
+
 private func enrichment(entries: [LocalUsageReader.Entry]) -> ProviderEnrichment {
     let now = Date()
     let monthStart = LocalUsageReader.startOfMonth(now)
@@ -101,12 +131,31 @@ private actor LocalAdditionalUsageCache {
         let loadedAt: Date
         let monthKey: String
         let entries: [LocalUsageReader.Entry]
-        /// Cursor `cursorDiskKV` has no time column — per-DB rowid high-water for append-only bubbles.
+        /// Cursor `cursorDiskKV` / Copilot `assistant_usage_events` have no usable
+        /// time column for the cache key — per-DB high-water for append-only rows.
         let highWaterByPath: [String: Int64]
+        /// Kiro skip state lives next to the entries it justifies. A month-key
+        /// drop that empties `entries` also drops the signatures, so the skip
+        /// cannot fire against an empty `existing` (#179).
+        let kiroSignatures: [String: (mtime: Date, size: Int)]
+    }
+
+    private struct ScanResult: Sendable {
+        var entries: [LocalUsageReader.Entry]
+        var highWaterByPath: [String: Int64] = [:]
+        var kiroSignatures: [String: (mtime: Date, size: Int)] = [:]
     }
 
     private var cached: [LocalAdditionalSource: Cached] = [:]
-    private var inFlight: [LocalAdditionalSource: Task<(entries: [LocalUsageReader.Entry], highWaterByPath: [String: Int64]), Never>] = [:]
+    private var inFlight: [LocalAdditionalSource: Task<ScanResult, Never>] = [:]
+    /// Bumped by `invalidate()` so a scan that started on old roots cannot republish.
+    private var epoch = 0
+
+    func invalidate() {
+        epoch += 1
+        cached = [:]
+        inFlight = [:]
+    }
 
     func entries(for source: LocalAdditionalSource) async -> [LocalUsageReader.Entry] {
         let now = Date()
@@ -145,46 +194,68 @@ private actor LocalAdditionalUsageCache {
         case .hermes:
             since = periodStart
             afterRowIDByPath = [:]
+        case .kiro:
+            // Kiro rewrites a conversation's whole history JSON in place every turn — there
+            // is no append-only table with a monotonic id to watermark, so every scan
+            // re-reads and re-derives entries (idempotent via the stable per-turn id).
+            // Unlike Hermes' durable `sessions` table, `/clear` and compaction *delete* turns
+            // from Kiro's DB outright, so this source also merges with `existing` below —
+            // a cleared turn must stay counted for the rest of the process lifetime, not
+            // silently drop out of today's total.
+            since = periodStart
+            afterRowIDByPath = [:]
         }
         let existing = previous?.entries ?? []
+        let knownKiro = previous?.kiroSignatures ?? [:]
         let task = Task.detached(priority: .utility) {
-            () -> (entries: [LocalUsageReader.Entry], highWaterByPath: [String: Int64]) in
+            () -> ScanResult in
             switch source {
             case .opencode:
                 let loaded = LocalAdditionalUsageReader.openCodeEntries(modifiedSince: since)
-                return (LocalUsageReader.dedupKeepMax(existing + loaded), [:])
+                return ScanResult(entries: LocalUsageReader.dedupKeepMax(existing + loaded))
             case .hermes:
-                return (LocalAdditionalUsageReader.hermesEntries(modifiedSince: since), [:])
+                return ScanResult(entries: LocalAdditionalUsageReader.hermesEntries(modifiedSince: since))
+            case .kiro:
+                let loaded = LocalAdditionalUsageReader.kiroEntries(
+                    modifiedSince: since, knownSignatures: knownKiro)
+                return ScanResult(
+                    entries: LocalUsageReader.dedupKeepMax(existing + loaded.entries),
+                    kiroSignatures: loaded.signatures)
             case .cursor:
                 let loaded = LocalAdditionalUsageReader.cursorEntries(
                     modifiedSince: since, afterRowIDByPath: afterRowIDByPath)
                 // DB rewrite / VACUUM can drop max(rowid) below the watermark — discard
                 // the stale in-memory set and take the full rescan result.
                 if loaded.didReset {
-                    return (loaded.entries, loaded.highWaterByPath)
+                    return ScanResult(entries: loaded.entries, highWaterByPath: loaded.highWaterByPath)
                 }
-                return (
-                    LocalUsageReader.dedupKeepMax(existing + loaded.entries),
-                    loaded.highWaterByPath)
+                return ScanResult(
+                    entries: LocalUsageReader.dedupKeepMax(existing + loaded.entries),
+                    highWaterByPath: loaded.highWaterByPath)
             case .copilot:
                 let loaded = LocalAdditionalUsageReader.copilotEntries(
                     modifiedSince: since, afterRowIDByPath: afterRowIDByPath)
                 // A pruned / recreated session store restarts ids — the cached rows would
                 // then collide with different events, so keep only the rescan.
                 if loaded.didReset {
-                    return (loaded.entries, loaded.highWaterByPath)
+                    return ScanResult(entries: loaded.entries, highWaterByPath: loaded.highWaterByPath)
                 }
-                return (
-                    LocalUsageReader.dedupKeepMax(existing + loaded.entries),
-                    loaded.highWaterByPath)
+                return ScanResult(
+                    entries: LocalUsageReader.dedupKeepMax(existing + loaded.entries),
+                    highWaterByPath: loaded.highWaterByPath)
             }
         }
+        let startEpoch = epoch
         inFlight[source] = task
         let result = await task.value
+        if startEpoch != epoch {
+            return result.entries
+        }
         inFlight[source] = nil
         cached[source] = Cached(
             loadedAt: now, monthKey: monthKey, entries: result.entries,
-            highWaterByPath: result.highWaterByPath)
+            highWaterByPath: result.highWaterByPath,
+            kiroSignatures: result.kiroSignatures)
         return result.entries
     }
 }
@@ -194,16 +265,45 @@ private actor LocalAdditionalUsageCache {
 enum LocalAdditionalUsageReader {
     typealias Object = [String: Any]
 
+    /// Drop the 30s hit so a newly saved extra folder is scanned on the next refresh (#177).
+    static func invalidateScanCache() async {
+        await LocalAdditionalUsageCache.shared.invalidate()
+    }
+
     static var defaultOpenCodeRoots: [URL] {
         environmentPaths("OPENCODE_DATA_DIR")
             ?? [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/opencode")]
+    }
+
+    static func openCodeRoots(
+        customRootsValue: String? = nil,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let curated = environmentPaths("OPENCODE_DATA_DIR")
+            ?? [home.appendingPathComponent(".local/share/opencode")]
+        return CustomScanRoots.union(defaults: curated, extraRaw: customRootsValue)
+    }
+
+    static var defaultHermesRoots: [URL] {
+        environmentPaths("HERMES_HOME")
+            ?? [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".hermes")]
+    }
+
+    static func hermesRoots(
+        customRootsValue: String? = nil,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let curated = environmentPaths("HERMES_HOME")
+            ?? [home.appendingPathComponent(".hermes")]
+        return CustomScanRoots.union(defaults: curated, extraRaw: customRootsValue)
     }
 
     static func openCodeEntries(
         modifiedSince: Date,
         roots: [URL]? = nil
     ) -> [LocalUsageReader.Entry] {
-        let sourceRoots = roots ?? defaultOpenCodeRoots
+        let sourceRoots = roots ?? openCodeRoots(
+            customRootsValue: CustomScanRoots.storedValue(for: "opencode"))
         var entries: [LocalUsageReader.Entry] = []
         for root in sourceRoots {
             if let database = preferredOpenCodeDatabase(in: root) {
@@ -224,8 +324,8 @@ enum LocalAdditionalUsageReader {
         modifiedSince: Date,
         roots: [URL]? = nil
     ) -> [LocalUsageReader.Entry] {
-        let sourceRoots = roots ?? environmentPaths("HERMES_HOME")
-            ?? [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".hermes")]
+        let sourceRoots = roots ?? hermesRoots(
+            customRootsValue: CustomScanRoots.storedValue(for: "hermes"))
         var seen = Set<String>()
         var entries: [LocalUsageReader.Entry] = []
         for root in sourceRoots {
@@ -334,9 +434,24 @@ enum LocalAdditionalUsageReader {
         } ?? []
     }
 
-    // MARK: Cursor database
+    // MARK: Incremental SQLite stores
 
-    struct CursorLoadResult: Sendable {
+    /// How to bind one append-only row query. Column 0 must be the monotonic id
+    /// used as the per-database watermark (`rowid` for Cursor, `id` for Copilot).
+    ///
+    /// `rowSQL` is a closure rather than a single string because Cursor has two
+    /// statements (cold GLOB vs incremental `NOT INDEXED`) and Copilot binds a
+    /// second text cutoff. The watermark rules themselves stay in
+    /// `scanIncrementalStores` (#157).
+    struct IncrementalRowQuery: Sendable {
+        var sql: String
+        var bindInt64: Int64?
+        var bindText: String?
+    }
+
+    /// Shared Cursor/Copilot load payload. Identical members collapsed into one
+    /// type so a watermark fix cannot land in only one copy.
+    struct IncrementalStoreLoadResult: Sendable {
         var entries: [LocalUsageReader.Entry]
         var highWaterByPath: [String: Int64]
         /// True when any DB was rescanned from scratch (watermark invalidated).
@@ -346,30 +461,43 @@ enum LocalAdditionalUsageReader {
         var highWaterRowID: Int64 { highWaterByPath.values.max() ?? 0 }
     }
 
-    static var defaultCursorRoots: [URL] {
-        environmentPaths("CURSOR_DATA_DIR") ?? [
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage"),
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Cursor Nightly/User/globalStorage"),
-        ]
-    }
+    typealias CursorLoadResult = IncrementalStoreLoadResult
+    typealias CopilotLoadResult = IncrementalStoreLoadResult
 
-    static func cursorEntries(
+    /// Incremental scan for append-only SQLite stores.
+    ///
+    /// Format-specific pieces (`databaseURL`, `maxRowIDSQL`, `rowSQL`, `parse`)
+    /// stay with the provider. These rules live here once:
+    /// - a failed `MAX(...)` is not a shrink (`nil` keeps the prior watermark)
+    /// - `if highWater == 0 { highWater = effectiveAfter }` so an empty
+    ///   incremental read does not replay the month
+    /// - `didReset` on any root cold-rescans **every** root so a partial
+    ///   payload cannot replace the cache
+    static func scanIncrementalStores(
+        roots: [URL],
         modifiedSince: Date,
         afterRowID: Int64 = 0,
         afterRowIDByPath: [String: Int64]? = nil,
-        roots: [URL]? = nil
-    ) -> CursorLoadResult {
-        let sourceRoots = roots ?? defaultCursorRoots
-        let marks = Self.cursorWatermarks(
-            roots: sourceRoots, afterRowID: afterRowID, afterRowIDByPath: afterRowIDByPath)
-        var result = scanCursorRoots(sourceRoots, modifiedSince: modifiedSince, marks: marks)
+        databaseURL: (URL) -> URL,
+        maxRowIDSQL: String,
+        rowSQL: (Int64, Date) -> IncrementalRowQuery,
+        parse: (OpaquePointer, URL) -> LocalUsageReader.Entry?
+    ) -> IncrementalStoreLoadResult {
+        let marks = incrementalWatermarks(
+            roots: roots, afterRowID: afterRowID, afterRowIDByPath: afterRowIDByPath,
+            databaseURL: databaseURL)
+        var result = scanIncrementalRoots(
+            roots, modifiedSince: modifiedSince, marks: marks,
+            databaseURL: databaseURL, maxRowIDSQL: maxRowIDSQL,
+            rowSQL: rowSQL, parse: parse)
         if result.didReset {
             // A partial incremental payload must not replace the cache — rescan every root cold.
             // Keep didReset=true so the provider cache discards `existing` rather than merging.
-            let recovered = scanCursorRoots(sourceRoots, modifiedSince: modifiedSince, marks: [:])
-            result = CursorLoadResult(
+            let recovered = scanIncrementalRoots(
+                roots, modifiedSince: modifiedSince, marks: [:],
+                databaseURL: databaseURL, maxRowIDSQL: maxRowIDSQL,
+                rowSQL: rowSQL, parse: parse)
+            result = IncrementalStoreLoadResult(
                 entries: recovered.entries,
                 highWaterByPath: recovered.highWaterByPath,
                 didReset: true)
@@ -378,101 +506,83 @@ enum LocalAdditionalUsageReader {
     }
 
     /// Resolve per-database watermarks. An empty marks map means cold-scan every root.
-    private static func cursorWatermarks(
+    private static func incrementalWatermarks(
         roots: [URL],
         afterRowID: Int64,
-        afterRowIDByPath: [String: Int64]?
+        afterRowIDByPath: [String: Int64]?,
+        databaseURL: (URL) -> URL
     ) -> [String: Int64] {
         if let afterRowIDByPath { return afterRowIDByPath }
         guard afterRowID > 0 else { return [:] }
         return Dictionary(uniqueKeysWithValues: roots.map { root in
-            (cursorDatabaseURL(from: root).path, afterRowID)
+            (databaseURL(root).path, afterRowID)
         })
     }
 
-    private static func cursorDatabaseURL(from root: URL) -> URL {
-        root.pathExtension == "vscdb" ? root : root.appendingPathComponent("state.vscdb")
-    }
-
-    private static func scanCursorRoots(
+    private static func scanIncrementalRoots(
         _ sourceRoots: [URL],
         modifiedSince: Date,
-        marks: [String: Int64]
-    ) -> CursorLoadResult {
+        marks: [String: Int64],
+        databaseURL: (URL) -> URL,
+        maxRowIDSQL: String,
+        rowSQL: (Int64, Date) -> IncrementalRowQuery,
+        parse: (OpaquePointer, URL) -> LocalUsageReader.Entry?
+    ) -> IncrementalStoreLoadResult {
         var entries: [LocalUsageReader.Entry] = []
         var highWaterByPath: [String: Int64] = [:]
         var didReset = false
         for root in sourceRoots {
-            let database = cursorDatabaseURL(from: root)
+            let database = databaseURL(root)
             let pathKey = database.path
-            let watermark = marks[pathKey] ?? 0
-            let loaded = cursorDatabaseEntries(database, modifiedSince: modifiedSince, afterRowID: watermark)
+            let loaded = loadIncrementalDatabase(
+                database, modifiedSince: modifiedSince,
+                afterRowID: marks[pathKey] ?? 0,
+                maxRowIDSQL: maxRowIDSQL, rowSQL: rowSQL, parse: parse)
             entries += loaded.entries
             highWaterByPath[pathKey] = loaded.highWaterRowID
             if loaded.didReset { didReset = true }
         }
-        return CursorLoadResult(
+        return IncrementalStoreLoadResult(
             entries: LocalUsageReader.dedupKeepMax(entries.filter { $0.date >= modifiedSince }),
             highWaterByPath: highWaterByPath,
             didReset: didReset)
     }
 
-    /// Exposed for regression tests — incremental plan must walk rowids, not the key index.
-    static func cursorIncrementalQueryPlan(database: URL, afterRowID: Int64) -> String? {
-        guard afterRowID > 0 else { return nil }
-        let sql = """
-        EXPLAIN QUERY PLAN
-        SELECT rowid, key, value FROM cursorDiskKV NOT INDEXED
-        WHERE rowid > ?1 AND key GLOB 'bubbleId:*'
-        """
-        return explainQueryPlan(database, sql: sql, bindInt64: afterRowID)
-    }
-
-    private struct CursorDatabaseLoad {
+    private struct IncrementalDatabaseLoad {
         var entries: [LocalUsageReader.Entry]
         var highWaterRowID: Int64
         var didReset: Bool
     }
 
-    private static func cursorDatabaseEntries(
+    private static func loadIncrementalDatabase(
         _ database: URL,
         modifiedSince: Date,
-        afterRowID: Int64
-    ) -> CursorDatabaseLoad {
-        // cursorDiskKV: key TEXT UNIQUE, value BLOB. No time column — filter by createdAt in JSON.
-        // Cold start (afterRowID == 0): GLOB uses the key index over bubbleId:* only.
-        // Incremental: NOT INDEXED + rowid > ? forces a rowid walk of *new* rows only.
-        // Without NOT INDEXED, SQLite prefers the key index and re-walks all bubble keys.
-        //
-        // A failed MAX(rowid) is *not* a shrink: open/prepare can fail while Cursor writes
-        // state.vscdb. Collapsing nil → 0 would wipe the cache for up to one refreshInterval.
-        guard let maxRowID = scalarInt64(database, sql: "SELECT MAX(rowid) FROM cursorDiskKV") else {
-            return CursorDatabaseLoad(entries: [], highWaterRowID: afterRowID, didReset: false)
+        afterRowID: Int64,
+        maxRowIDSQL: String,
+        rowSQL: (Int64, Date) -> IncrementalRowQuery,
+        parse: (OpaquePointer, URL) -> LocalUsageReader.Entry?
+    ) -> IncrementalDatabaseLoad {
+        // A failed MAX is *not* a shrink: open/prepare can fail while the writer
+        // holds the file. Collapsing nil → 0 would wipe the cache for up to one
+        // refreshInterval.
+        guard let maxRowID = scalarInt64(database, sql: maxRowIDSQL) else {
+            return IncrementalDatabaseLoad(
+                entries: [], highWaterRowID: afterRowID, didReset: false)
         }
         let didReset = afterRowID > 0 && maxRowID < afterRowID
         let effectiveAfter = didReset ? 0 : afterRowID
-
-        let sql: String
-        let bind: Int64?
-        if effectiveAfter == 0 {
-            sql = "SELECT rowid, key, value FROM cursorDiskKV WHERE key GLOB 'bubbleId:*'"
-            bind = nil
-        } else {
-            sql = """
-            SELECT rowid, key, value FROM cursorDiskKV NOT INDEXED
-            WHERE rowid > ?1 AND key GLOB 'bubbleId:*'
-            """
-            bind = effectiveAfter
-        }
+        let querySpec = rowSQL(effectiveAfter, modifiedSince)
 
         // Incomplete scans (BUSY / interrupt) return nil — keep the prior watermark.
-        guard let rows = query(database, sql: sql, bindInt64: bind, row: {
-            statement -> (Int64, LocalUsageReader.Entry?) in
-            let rowID = sqlite3_column_int64(statement, 0)
-            let entry = parseCursorBubbleRow(statement, modifiedSince: modifiedSince)
-            return (rowID, entry)
-        }) else {
-            return CursorDatabaseLoad(entries: [], highWaterRowID: afterRowID, didReset: false)
+        guard let rows = query(
+            database, sql: querySpec.sql,
+            bindInt64: querySpec.bindInt64, bindText: querySpec.bindText,
+            row: { statement -> (Int64, LocalUsageReader.Entry?) in
+                (sqlite3_column_int64(statement, 0), parse(statement, database))
+            }
+        ) else {
+            return IncrementalDatabaseLoad(
+                entries: [], highWaterRowID: afterRowID, didReset: false)
         }
 
         var highWater: Int64 = 0
@@ -483,7 +593,81 @@ enum LocalAdditionalUsageReader {
         }
         // Preserve watermark when an incremental miss returns no new rows.
         if highWater == 0 { highWater = effectiveAfter }
-        return CursorDatabaseLoad(entries: entries, highWaterRowID: highWater, didReset: didReset)
+        return IncrementalDatabaseLoad(
+            entries: entries, highWaterRowID: highWater, didReset: didReset)
+    }
+
+    // MARK: Cursor database
+
+
+    static var defaultCursorRoots: [URL] {
+        environmentPaths("CURSOR_DATA_DIR") ?? [
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage"),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Cursor Nightly/User/globalStorage"),
+        ]
+    }
+
+    static func cursorRoots(
+        customRootsValue: String? = nil,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let curated = environmentPaths("CURSOR_DATA_DIR") ?? [
+            home.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage"),
+            home.appendingPathComponent("Library/Application Support/Cursor Nightly/User/globalStorage"),
+        ]
+        return CustomScanRoots.union(defaults: curated, extraRaw: customRootsValue)
+    }
+
+    static func cursorEntries(
+        modifiedSince: Date,
+        afterRowID: Int64 = 0,
+        afterRowIDByPath: [String: Int64]? = nil,
+        roots: [URL]? = nil
+    ) -> CursorLoadResult {
+        scanIncrementalStores(
+            roots: roots ?? cursorRoots(customRootsValue: CustomScanRoots.storedValue(for: "cursor")),
+            modifiedSince: modifiedSince,
+            afterRowID: afterRowID,
+            afterRowIDByPath: afterRowIDByPath,
+            databaseURL: cursorDatabaseURL(from:),
+            maxRowIDSQL: "SELECT MAX(rowid) FROM cursorDiskKV",
+            rowSQL: { effectiveAfter, _ in cursorRowQuery(effectiveAfter: effectiveAfter) },
+            parse: { statement, _ in
+                parseCursorBubbleRow(statement, modifiedSince: modifiedSince)
+            })
+    }
+
+    /// cursorDiskKV: key TEXT UNIQUE, value BLOB. No time column — filter by
+    /// createdAt in JSON. Cold start uses the key index over bubbleId:* only.
+    /// Incremental: NOT INDEXED + rowid > ? walks *new* rows; without NOT INDEXED
+    /// SQLite prefers the key index. Shared with `cursorIncrementalQueryPlan` so
+    /// the EXPLAIN test pins the SQL the scanner actually runs.
+    private static func cursorRowQuery(effectiveAfter: Int64) -> IncrementalRowQuery {
+        if effectiveAfter == 0 {
+            return IncrementalRowQuery(
+                sql: "SELECT rowid, key, value FROM cursorDiskKV WHERE key GLOB 'bubbleId:*'",
+                bindInt64: nil, bindText: nil)
+        }
+        return IncrementalRowQuery(
+            sql: """
+            SELECT rowid, key, value FROM cursorDiskKV NOT INDEXED
+            WHERE rowid > ?1 AND key GLOB 'bubbleId:*'
+            """,
+            bindInt64: effectiveAfter, bindText: nil)
+    }
+
+    private static func cursorDatabaseURL(from root: URL) -> URL {
+        root.pathExtension == "vscdb" ? root : root.appendingPathComponent("state.vscdb")
+    }
+
+    /// Exposed for regression tests — incremental plan must walk rowids, not the key index.
+    static func cursorIncrementalQueryPlan(database: URL, afterRowID: Int64) -> String? {
+        guard afterRowID > 0 else { return nil }
+        let query = cursorRowQuery(effectiveAfter: afterRowID)
+        return explainQueryPlan(
+            database, sql: "EXPLAIN QUERY PLAN \(query.sql)", bindInt64: query.bindInt64)
     }
 
     private static func parseCursorBubbleRow(
@@ -556,19 +740,18 @@ enum LocalAdditionalUsageReader {
 
     // MARK: Copilot CLI database
 
-    struct CopilotLoadResult: Sendable {
-        var entries: [LocalUsageReader.Entry]
-        var highWaterByPath: [String: Int64]
-        /// True when a database was rescanned from scratch (watermark invalidated).
-        var didReset: Bool
-
-        /// Convenience for single-database tests.
-        var highWaterRowID: Int64 { highWaterByPath.values.max() ?? 0 }
-    }
-
     static var defaultCopilotRoots: [URL] {
         environmentPaths("COPILOT_HOME")
             ?? [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".copilot")]
+    }
+
+    static func copilotRoots(
+        customRootsValue: String? = nil,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let curated = environmentPaths("COPILOT_HOME")
+            ?? [home.appendingPathComponent(".copilot")]
+        return CustomScanRoots.union(defaults: curated, extraRaw: customRootsValue)
     }
 
     /// Read Copilot CLI usage rows newer than `modifiedSince`.
@@ -585,113 +768,40 @@ enum LocalAdditionalUsageReader {
         afterRowIDByPath: [String: Int64]? = nil,
         roots: [URL]? = nil
     ) -> CopilotLoadResult {
-        let sourceRoots = roots ?? defaultCopilotRoots
-        let marks = copilotWatermarks(
-            roots: sourceRoots, afterRowID: afterRowID, afterRowIDByPath: afterRowIDByPath)
-        var result = scanCopilotRoots(sourceRoots, modifiedSince: modifiedSince, marks: marks)
-        if result.didReset {
-            // A partial incremental payload must not replace the cache — rescan every root cold.
-            let recovered = scanCopilotRoots(sourceRoots, modifiedSince: modifiedSince, marks: [:])
-            result = CopilotLoadResult(
-                entries: recovered.entries,
-                highWaterByPath: recovered.highWaterByPath,
-                didReset: true)
-        }
-        return result
-    }
-
-    private static func copilotWatermarks(
-        roots: [URL],
-        afterRowID: Int64,
-        afterRowIDByPath: [String: Int64]?
-    ) -> [String: Int64] {
-        if let afterRowIDByPath { return afterRowIDByPath }
-        guard afterRowID > 0 else { return [:] }
-        return Dictionary(uniqueKeysWithValues: roots.map { root in
-            (copilotDatabaseURL(from: root).path, afterRowID)
-        })
+        scanIncrementalStores(
+            roots: roots ?? copilotRoots(customRootsValue: CustomScanRoots.storedValue(for: "copilot")),
+            modifiedSince: modifiedSince,
+            afterRowID: afterRowID,
+            afterRowIDByPath: afterRowIDByPath,
+            databaseURL: copilotDatabaseURL(from:),
+            maxRowIDSQL: "SELECT MAX(id) FROM assistant_usage_events",
+            rowSQL: { effectiveAfter, since in
+                // `created_at` is text, so the cutoff is a lexicographic compare, not a
+                // time compare. It is only a coarse prefilter — the shared scanner
+                // re-filters on parsed dates — but it must never drop a row that belongs
+                // in the window, and a dropped row is lost for good once a later id
+                // advances the watermark. A same-day row in the ISO-8601 shape is safe
+                // (its "T" sorts after the cutoff's space), yet a row carrying a UTC
+                // offset can still render an earlier calendar day than the instant it
+                // represents ("2026-01-03T20:00:00-05:00" is 2026-01-04T01:00:00Z).
+                // Backing the cutoff off by a full day covers every offset SQLite
+                // accepts (±14h) and costs one extra day of rows.
+                IncrementalRowQuery(
+                    sql: """
+                    SELECT id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at
+                    FROM assistant_usage_events
+                    WHERE id > ?1 AND created_at >= ?2
+                    """,
+                    bindInt64: effectiveAfter,
+                    bindText: copilotDayCutoff(since))
+            },
+            parse: { statement, database in
+                parseCopilotUsageRow(statement, database: database)
+            })
     }
 
     private static func copilotDatabaseURL(from root: URL) -> URL {
         root.pathExtension == "db" ? root : root.appendingPathComponent("session-store.db")
-    }
-
-    private static func scanCopilotRoots(
-        _ sourceRoots: [URL],
-        modifiedSince: Date,
-        marks: [String: Int64]
-    ) -> CopilotLoadResult {
-        var entries: [LocalUsageReader.Entry] = []
-        var highWaterByPath: [String: Int64] = [:]
-        var didReset = false
-        for root in sourceRoots {
-            let database = copilotDatabaseURL(from: root)
-            let pathKey = database.path
-            let loaded = copilotDatabaseEntries(
-                database, modifiedSince: modifiedSince, afterRowID: marks[pathKey] ?? 0)
-            entries += loaded.entries
-            highWaterByPath[pathKey] = loaded.highWaterRowID
-            if loaded.didReset { didReset = true }
-        }
-        return CopilotLoadResult(
-            entries: LocalUsageReader.dedupKeepMax(entries.filter { $0.date >= modifiedSince }),
-            highWaterByPath: highWaterByPath,
-            didReset: didReset)
-    }
-
-    private struct CopilotDatabaseLoad {
-        var entries: [LocalUsageReader.Entry]
-        var highWaterRowID: Int64
-        var didReset: Bool
-    }
-
-    private static func copilotDatabaseEntries(
-        _ database: URL,
-        modifiedSince: Date,
-        afterRowID: Int64
-    ) -> CopilotDatabaseLoad {
-        // A failed MAX(id) is not a shrink: open/prepare can fail while the CLI writes the
-        // store. Collapsing nil → 0 would wipe the cache for up to one refresh interval.
-        guard let maxRowID = scalarInt64(database, sql: "SELECT MAX(id) FROM assistant_usage_events") else {
-            return CopilotDatabaseLoad(entries: [], highWaterRowID: afterRowID, didReset: false)
-        }
-        let didReset = afterRowID > 0 && maxRowID < afterRowID
-        let effectiveAfter = didReset ? 0 : afterRowID
-
-        // `created_at` is text, so the cutoff is a lexicographic compare, not a time compare.
-        // It is only a coarse prefilter — `scanCopilotRoots` re-filters on parsed dates — but
-        // it must never drop a row that belongs in the window, and a dropped row is lost for
-        // good once a later id advances the watermark. A same-day row in the ISO-8601 shape is
-        // safe (its "T" sorts after the cutoff's space), yet a row carrying a UTC offset can
-        // still render an earlier calendar day than the instant it represents
-        // ("2026-01-03T20:00:00-05:00" is 2026-01-04T01:00:00Z). Backing the cutoff off by a
-        // full day covers every offset SQLite accepts (±14h) and costs one extra day of rows.
-        let sql = """
-        SELECT id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at
-        FROM assistant_usage_events
-        WHERE id > ?1 AND created_at >= ?2
-        """
-        guard let rows = query(
-            database, sql: sql,
-            bindInt64: effectiveAfter,
-            bindText: copilotDayCutoff(modifiedSince),
-            row: { statement -> (Int64, LocalUsageReader.Entry?) in
-                (sqlite3_column_int64(statement, 0), parseCopilotUsageRow(statement, database: database))
-            }) else {
-            // Incomplete scan (BUSY / interrupt) — keep the prior watermark.
-            return CopilotDatabaseLoad(entries: [], highWaterRowID: afterRowID, didReset: false)
-        }
-
-        var highWater: Int64 = 0
-        var entries: [LocalUsageReader.Entry] = []
-        for (rowID, entry) in rows {
-            highWater = max(highWater, rowID)
-            if let entry { entries.append(entry) }
-        }
-        // Rows before the cutoff are filtered out in SQL, so an empty incremental read must
-        // not reset the watermark back to zero.
-        if highWater == 0 { highWater = effectiveAfter }
-        return CopilotDatabaseLoad(entries: entries, highWaterRowID: highWater, didReset: didReset)
     }
 
     private static func parseCopilotUsageRow(
@@ -746,6 +856,194 @@ enum LocalAdditionalUsageReader {
         return parseISO8601(text)
     }
 
+    // MARK: Kiro CLI database
+
+    static var defaultKiroRoots: [URL] {
+        environmentPaths("KIRO_CLI_HOME")
+            ?? [FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/kiro-cli")]
+    }
+
+    static func kiroRoots(
+        customRootsValue: String? = nil,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let curated = environmentPaths("KIRO_CLI_HOME")
+            ?? [home.appendingPathComponent("Library/Application Support/kiro-cli")]
+        return CustomScanRoots.union(defaults: curated, extraRaw: customRootsValue)
+    }
+
+    /// Read Kiro CLI usage turns newer than `modifiedSince`.
+    ///
+    /// Kiro persists a conversation as one row whose `value` column holds the *entire*
+    /// history as JSON, rewritten in place on every turn — there is no per-row token count
+    /// (see the type doc on `LocalKiroProvider`) and no append-only id to watermark, so this
+    /// cannot advance a row id. Two schema generations coexist:
+    /// `conversations_v2` (kiro-cli < 2.0.1, dedicated `conversation_id`/`key`/timestamp
+    /// columns) and `conversations` (2.0.1+, keyed by working directory; the JSON itself
+    /// carries `conversation_id`). Both wrap the same turn shape, so they share a parser.
+    ///
+    /// `modifiedSince` is applied *after* the JSON parse (`kiroTurnEntries`), so it
+    /// bounds the output, not the work (#178). The cheap gate is the database
+    /// file's own signature — reused from `LocalAntigravityUsageReader.signature`
+    /// (`.sqlite3` + `-wal`, never `-shm`). An unchanged file returns `[]`; the
+    /// `.kiro` cache merges `existing + loaded`, so that keeps previously-seen
+    /// entries. Signatures are supplied by that cache (`knownSignatures`) and
+    /// die with it on a month-key drop, so a skip cannot fire against empty
+    /// `existing` (#179). The first scan of a process passes `[:]`.
+    static func kiroEntries(
+        modifiedSince: Date,
+        roots: [URL]? = nil
+    ) -> [LocalUsageReader.Entry] {
+        kiroEntries(modifiedSince: modifiedSince, knownSignatures: [:], roots: roots).entries
+    }
+
+    static func kiroEntries(
+        modifiedSince: Date,
+        knownSignatures: [String: (mtime: Date, size: Int)],
+        roots: [URL]? = nil
+    ) -> (entries: [LocalUsageReader.Entry], signatures: [String: (mtime: Date, size: Int)]) {
+        let sourceRoots = roots ?? kiroRoots(
+            customRootsValue: CustomScanRoots.storedValue(for: "kiro"))
+        var entries: [LocalUsageReader.Entry] = []
+        var signatures: [String: (mtime: Date, size: Int)] = [:]
+        for root in sourceRoots {
+            let database = kiroDatabaseURL(from: root)
+            let scanned = kiroDatabaseEntries(
+                database, modifiedSince: modifiedSince, known: knownSignatures)
+            entries += scanned.entries
+            if let signature = scanned.signature {
+                signatures[database.path] = signature
+            }
+        }
+        return (LocalUsageReader.dedupKeepMax(entries), signatures)
+    }
+
+    private static func kiroDatabaseURL(from root: URL) -> URL {
+        root.pathExtension == "sqlite3" ? root : root.appendingPathComponent("data.sqlite3")
+    }
+
+    private static func kiroDatabaseEntries(
+        _ database: URL,
+        modifiedSince: Date,
+        known: [String: (mtime: Date, size: Int)]
+    ) -> (entries: [LocalUsageReader.Entry], signature: (mtime: Date, size: Int)?) {
+        // Stat before the read. A commit that lands mid-read then differs from
+        // the stored signature on the next poll and is re-read; stat afterwards
+        // and that same commit is frozen into a signature that already looks current.
+        let signature = LocalAntigravityUsageReader.signature(of: database)
+        if let signature,
+           let remembered = known[database.path],
+           remembered.mtime == signature.mtime,
+           remembered.size == signature.size {
+            return ([], signature)
+        }
+
+        var entries: [LocalUsageReader.Entry] = []
+
+        // kiro-cli < 2.0.1: one row per conversation, with dedicated id/timestamp columns.
+        let v2Rows = query(database, sql: "SELECT conversation_id, value FROM conversations_v2") {
+            statement -> (id: String?, value: String)? in
+            guard let value = columnText(statement, 1) else { return nil }
+            return (columnText(statement, 0), value)
+        }
+        // kiro-cli 2.0.1+: one row per working directory; the conversation id lives in the JSON.
+        // A 2.0.1+ store may still keep `conversations_v2` (nil here is a missing table
+        // *or* a scan that stopped early). `query` cannot tell them apart, so a BUSY on
+        // one generation plus a success on the other still counts as a completed scan.
+        let v1Rows = query(database, sql: "SELECT value FROM conversations") {
+            statement -> String? in columnText(statement, 0)
+        }
+        // Both nil: open/prepare/step failed (BUSY, corrupt, missing file that
+        // still couldn't be opened). Do not occupy the skip slot — the next
+        // poll must retry. A missing table on one generation is nil while the
+        // other succeeds, so "at least one non-nil" is a completed scan.
+        guard v2Rows != nil || v1Rows != nil else { return ([], nil) }
+
+        for row in v2Rows ?? [] {
+            guard let object = jsonObject(data: Data(row.value.utf8)) else { continue }
+            let conversationID = row.id ?? stringValue(object["conversation_id"]) ?? database.path
+            entries += kiroTurnEntries(conversationID: conversationID, object: object, modifiedSince: modifiedSince)
+        }
+        for value in v1Rows ?? [] {
+            guard let object = jsonObject(data: Data(value.utf8)),
+                  let conversationID = stringValue(object["conversation_id"]) else { continue }
+            entries += kiroTurnEntries(conversationID: conversationID, object: object, modifiedSince: modifiedSince)
+        }
+
+        return (entries, signature)
+    }
+
+    /// Bytes-per-token used to turn estimated byte counts into an approximate token count.
+    /// There is nothing more precise available locally.
+    private static let kiroBytesPerToken = 4
+
+    /// Kiro has no server-side session — every turn resends the *whole* conversation, so a
+    /// turn's real prompt size is the accumulated history plus its own new user message.
+    /// `request_metadata.user_prompt_length` is **not** that: in kiro-cli's upstream
+    /// (`aws/amazon-q-developer-cli`, `crates/chat-cli/src/cli/chat/parser.rs`) it is assigned
+    /// from `conversation_state.user_input_message.content.len()` — only the bytes the user
+    /// just typed, excluding the resent history entirely. Using it as-is would undercount a
+    /// prompt by orders of magnitude once a conversation has any length. `response_size`
+    /// (`received_response_size`, accumulated from the actual streamed response/tool-input
+    /// bytes) has no such gap and is used as-is for output.
+    private static func kiroTurnEntries(
+        conversationID: String,
+        object: Object,
+        modifiedSince: Date
+    ) -> [LocalUsageReader.Entry] {
+        guard let turns = object["history"] as? [Any] else { return [] }
+        var entries: [LocalUsageReader.Entry] = []
+        // `latest_summary` stands in for turns compaction deleted from `history` — it still
+        // gets resent on every later request, so it seeds the running total (matches the
+        // reference `kiro-usage` tool's `cumulative = summary_tok`).
+        var cumulativeHistoryBytes = kiroJSONValueByteLength(object["latest_summary"] ?? 0)
+        for turn in turns {
+            guard let turnObject = turn as? Object else { continue }
+            let userBytes = kiroFieldByteLength(turnObject["user"])
+            // Bytes must accumulate into history even for turns skipped below (missing
+            // timestamp, outside the window) — later turns still resend them.
+            defer { cumulativeHistoryBytes += userBytes + kiroFieldByteLength(turnObject["assistant"]) }
+
+            guard let meta = turnObject["request_metadata"] as? Object,
+                  // A turn missing its timestamp has nothing stable to key an entry id on —
+                  // skip it rather than invent one, matching the reference `kiro-usage` tool.
+                  let rawTimestamp = doubleValue(meta["request_start_timestamp_ms"]), rawTimestamp > 0,
+                  let date = dateValue(meta["request_start_timestamp_ms"]),
+                  date >= modifiedSince else { continue }
+            let promptBytes = cumulativeHistoryBytes + userBytes
+            guard let entry = makeEntry(
+                id: "kiro|\(conversationID)|\(Int64(rawTimestamp))",
+                date: date,
+                model: stringValue(meta["model_id"]) ?? "unknown",
+                input: promptBytes / kiroBytesPerToken,
+                output: intValue(meta["response_size"]) / kiroBytesPerToken) else { continue }
+            entries.append(entry)
+        }
+        return entries
+    }
+
+    /// Byte length of a turn's `user`/`assistant` field, matching the reference `kiro-usage`
+    /// tool's `_text_len`: sum the stringified value of every key except `images` (a base64
+    /// blob that would otherwise dwarf the actual text and isn't separately token-modeled here).
+    private static func kiroFieldByteLength(_ value: Any?) -> Int {
+        guard let dict = value as? Object else {
+            if let string = value as? String { return string.utf8.count }
+            return 0
+        }
+        return dict.reduce(0) { total, entry in
+            entry.key == "images" ? total : total + kiroJSONValueByteLength(entry.value)
+        }
+    }
+
+    private static func kiroJSONValueByteLength(_ value: Any) -> Int {
+        if let string = value as? String { return string.utf8.count }
+        if let number = value as? NSNumber { return number.stringValue.utf8.count }
+        if let array = value as? [Any] { return array.reduce(0) { $0 + kiroJSONValueByteLength($1) } }
+        if let dict = value as? Object { return dict.values.reduce(0) { $0 + kiroJSONValueByteLength($1) } }
+        return 0
+    }
+
     // MARK: Shared utilities
 
     private static func makeEntry(
@@ -778,8 +1076,10 @@ enum LocalAdditionalUsageReader {
             explicitCost: cost)
     }
 
+    /// GUI 앱은 셸 환경을 상속하지 않으므로 `UsageEnvironment` 를 통해 읽는다 — 프로세스 환경만
+    /// 보면 `~/.zshrc` 에 `export OPENCODE_DATA_DIR=…` 해 둔 사용자가 앱에서만 조용히 0 을 본다.
     private static func environmentPaths(_ key: String) -> [URL]? {
-        guard let raw = ProcessInfo.processInfo.environment[key] else { return nil }
+        guard let raw = UsageEnvironment.value(key) else { return nil }
         return raw.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }

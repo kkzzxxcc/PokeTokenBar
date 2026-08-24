@@ -81,6 +81,14 @@ private struct FakeCodexLimits: CodexLimitsProviding {
     func fetch() async throws -> CodexRateLimitStatus? { status }
 }
 
+private struct FakeAntigravityLimits: AntigravityLimitsProviding {
+    var status: AntigravityRateLimitStatus?
+    func fetch(allowKeychainPrompt: Bool) async throws -> AntigravityRateLimitStatus {
+        guard let status else { throw LimitsError.keychainInteractionNotAllowed }
+        return status
+    }
+}
+
 /// 호출마다 allowKeychainPrompt 값을 기록 — 자동/수동 경로가 올바른 플래그를 쓰는지 회귀 검증용.
 private final class RecordingClaudeLimits: ClaudeLimitsProviding, @unchecked Sendable {
     nonisolated(unsafe) var promptFlags: [Bool] = []
@@ -152,11 +160,13 @@ final class UsageStoreTests: XCTestCase {
     private func makeStore(
         providers: [any UsageProvider],
         claude: LimitStatus? = nil,
-        codex: CodexRateLimitStatus? = nil
+        codex: CodexRateLimitStatus? = nil,
+        antigravity: AntigravityRateLimitStatus? = nil
     ) -> UsageStore {
         UsageStore(providers: providers,
                    claudeLimitsProvider: FakeClaudeLimits(status: claude),
                    codexLimitsProvider: FakeCodexLimits(status: codex),
+                   antigravityLimitsProvider: FakeAntigravityLimits(status: antigravity),
                    autoRefresh: false,
                    defaults: testDefaults)
     }
@@ -164,7 +174,9 @@ final class UsageStoreTests: XCTestCase {
     private func makeStatusStore(_ stub: FakeStatusProvider) -> UsageStore {
         let claude = FakeUsageProvider(id: "claude_code", displayName: "Claude Code", daily: todayDaily(1_000))
         return UsageStore(providers: [claude], claudeLimitsProvider: FakeClaudeLimits(status: nil),
-                          codexLimitsProvider: FakeCodexLimits(status: nil), statusProvider: stub,
+                          codexLimitsProvider: FakeCodexLimits(status: nil),
+                          antigravityLimitsProvider: FakeAntigravityLimits(status: nil),
+                          statusProvider: stub,
                           autoRefresh: false, defaults: testDefaults)
     }
 
@@ -178,6 +190,7 @@ final class UsageStoreTests: XCTestCase {
         let store = UsageStore(providers: [p],
                                claudeLimitsProvider: FakeClaudeLimits(status: nil),
                                codexLimitsProvider: FakeCodexLimits(status: nil),
+                               antigravityLimitsProvider: FakeAntigravityLimits(status: nil),
                                statusProvider: FakeStatusProvider([:]),
                                autoRefresh: false, defaults: testDefaults)
         // A: 첫 refresh — fetchDaily 의 gate 에 걸려 in-flight 로 멈춘다.
@@ -577,6 +590,27 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(store.todayTokensByProvider.values.reduce(0, +), store.todayTotalTokens)
         XCTAssertNotNil(store.lastUpdated)
         XCTAssertNil(store.lastErrorDescription)
+    }
+
+    /// [issue #115 DoD] 신규 provider(kiro) 의 snapshot 이 today/week/month/burn 전부에 흘러가는지 확인.
+    /// (파서/스키마 회귀는 KiroUsageTests.swift 담당 — 여기는 store 집계 경로만 본다.)
+    func testKiroSnapshotFlowsThroughTodayWeekMonthAndBurn() async {
+        let claude = FakeUsageProvider(id: "claude_code", displayName: "Claude Code", daily: todayDaily(100_000_000))
+        let kiro = FakeUsageProvider(id: "kiro", displayName: "Kiro", daily: todayDaily(50_000_000), reportsCost: false)
+        kiro.enrichment = ProviderEnrichment(
+            activeBlock: block(tokensPerMinute: 200_000), blocksOK: true,
+            weekTotal: PeriodUsage(period: "w", totalTokens: 90_000_000, totalCost: 0),
+            monthTotal: PeriodUsage(period: "m", totalTokens: 300_000_000, totalCost: 0),
+            periodsOK: true)
+        let store = makeStore(providers: [claude, kiro])
+        await store.refresh(scheduleEmptyRetry: false)
+
+        XCTAssertEqual(store.todayTotalTokens, 150_000_000)
+        XCTAssertEqual(store.todayTokensByProvider["kiro"], 50_000_000)
+        XCTAssertEqual(store.weekTotalTokens, 90_000_000)
+        XCTAssertEqual(store.monthTotalTokens, 300_000_000)
+        XCTAssertEqual(store.burnTier, .fast, "burn 이 kiro 의 활성 블록을 반영")
+        XCTAssertEqual(store.snapshot(preferring: "kiro")?.providerID, "kiro", "탭에 노출됨")
     }
 
     func testCodexOnlyWhenClaudeHasNoData() async {

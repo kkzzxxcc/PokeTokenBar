@@ -14,6 +14,7 @@ func rarityColor(_ r: Rarity?) -> Color {
 let rarityDisplayOrder: [Rarity] = [.legendary, .rare, .uncommon, .common]
 
 /// 아이템 아이콘 — 실제 스프라이트(런타임 로드+캐시) 우선, 로딩 전/미제공/실패 시 이모지 폴백.
+@MainActor
 struct ItemIconView: View {
     let kind: ItemKind
     var size: CGFloat = 30
@@ -29,7 +30,11 @@ struct ItemIconView: View {
     var body: some View {
         Group {
             if let img {
+                // 아이템 PNG 는 대체로 정사각(30×30)이라 늘려도 티가 안 났지만, 소스가 외부(PokeAPI
+                // items)라 비정사각이 섞이면 그대로 왜곡된다 — 스프라이트와 같은 SpriteFit 규율.
+                let fit = SpriteFit.size(for: img.size, box: size)
                 Image(nsImage: img).resizable().interpolation(.none)
+                    .frame(width: fit.width, height: fit.height)
                     .frame(width: size, height: size)
             } else {
                 Text(kind.fallbackEmoji).font(.system(size: size))
@@ -77,6 +82,7 @@ struct SpriteSubject: Equatable {
 
 /// 스프라이트 1개(런타임 로드 + 캐시). 없으면 알 글리프. bob 으로 가벼운 상하 움직임.
 /// animated=true 면 Gen-V GIF 프레임을 순환(미지원/오프라인이면 정적+bob 으로 폴백).
+@MainActor
 struct SpriteView: View {
     let speciesID: Int?
     var size: CGFloat = 84
@@ -139,16 +145,31 @@ struct SpriteView: View {
         loadedID != id || loadedShiny != shiny
     }
 
+    /// size×size 슬롯 안에서 이 이미지가 실제로 차지할 크기 — 원본 비율 유지(SpriteFit).
+    /// 순수·테스트용. `.resizable()` 은 프레임을 그대로 채우므로(늘어남) 프레임을 미리 재서 넘긴다.
+    /// 정사각 원본(정적 96×96·아이템 30×30)은 size×size 그대로라 기존 레이아웃과 동일하다.
+    static func imageSize(for image: NSImage, box: CGFloat) -> CGSize {
+        SpriteFit.size(for: image.size, box: box)
+    }
+
+    /// 비율 유지로 잰 이미지 프레임 + 바깥 size×size 슬롯. 바깥 슬롯을 유지하는 이유: 진화 라인·도감
+    /// 그리드의 폭 계산(EvoLineView.rowWidth 등)이 칸을 정사각으로 전제한다 — 안쪽만 줄여야 안 흔들린다.
+    @ViewBuilder
+    private func fitted(_ image: NSImage) -> some View {
+        let fit = Self.imageSize(for: image, box: size)
+        Image(nsImage: image).resizable().interpolation(.none)
+            .frame(width: fit.width, height: fit.height)
+            .frame(width: size, height: size)
+    }
+
     var body: some View {
         Group {
             if !frames.isEmpty {
-                // GIF 애니메이션 경로 — 현재 프레임만 렌더
-                Image(nsImage: frames[frameIndex % frames.count].image)
-                    .resizable().interpolation(.none)
-                    .frame(width: size, height: size)
+                // GIF 애니메이션 경로 — 현재 프레임만 렌더. Gen-V GIF 캔버스는 종마다 비정사각이라
+                // (잭키 36×66) 정사각으로 늘리면 뚱뚱해진다 → fitted 로 비율 유지.
+                fitted(frames[frameIndex % frames.count].image)
             } else if let img {
-                Image(nsImage: img).resizable().interpolation(.none)
-                    .frame(width: size, height: size)
+                fitted(img)
             } else {
                 Text("🥚").font(.system(size: size * 0.62)).frame(width: size, height: size)
             }
@@ -216,6 +237,7 @@ struct SpriteView: View {
 /// 폭 제한 없는 HStack 은 팝오버 콘텐츠 폭(332pt)을 넘고, **넘친 자식이 부모 VStack 폭을 부풀려
 /// 팝오버 전체가 좌우로 잘린다**(진화줄뿐 아니라 탭바·합계까지). `maxWidth` 를 주면 그 폭 안에서
 /// 가로 스크롤한다 — 썸네일 크기는 유지하고, 가장자리 페이드 + 셰브론으로 스크롤 가능함을 알린다.
+@MainActor
 struct EvoLineView: View {
     let nodes: [EvoLineItem]
     let mysteryLabel: String
@@ -416,6 +438,7 @@ struct EvoLineView: View {
 }
 
 /// 팝오버 상단 — 현재 포켓몬 + 진화 진행 + 부화/진화 연출.
+@MainActor
 struct CompanionHeader: View {
     let store: CompanionStore
     // 연출 상태 — 부화/진화 순간 흰 플래시 + 스프링 스케일(본가 진화 신 오마주)
@@ -634,6 +657,7 @@ struct CompanionHeader: View {
 /// (solid 채움 대신 링+체크 — green/orange 위 흰 텍스트 대비 문제 회피 + 라이트/다크 양쪽 가독.
 ///  텍스트는 .primary 라 모드 자동 적응, 색 정체성은 점·링·체크로 유지 → 엔트리 배지와 안 어긋남.)
 /// 0이면 흐리게(필터 불가).
+@MainActor
 struct RarityTally: View {
     let label: String
     let count: Int
@@ -661,6 +685,7 @@ struct RarityTally: View {
 
 /// 포획 로그 요약 헤더 — 총 개체 수 + 희귀도별 개체 수 캡슐.
 /// 개수 단위가 개체(store.dexCount)라 종 단위인 도감 헤더와 공유하지 않는다.
+@MainActor
 struct DexSummaryHeader: View {
     let store: CompanionStore
     let selected: Rarity?                  // nil = 필터 없음(전체)
@@ -696,9 +721,10 @@ struct DexSummaryHeader: View {
 ///  - **로그**: 개체 1마리 = 1행. 같은 라인이 여러 행으로 나오는 게 정상 — 성격·획득 시각처럼
 ///    개체에 딸린 정보는 여기에만 있다.
 /// 상위 탭(PopoverTab)은 그대로 4개 — 세그먼트 폭(332/2)이 넉넉해 탭바를 늘릴 필요가 없다.
+@MainActor
 struct CollectionView: View {
     let store: CompanionStore
-    @State private var showingLog = false
+    let navigation: PopoverNavigation
     /// 로그 전용 희귀도 필터. 도감은 개수 단위가 종이라 자기 필터를 따로 갖는다(DexGridView).
     @State private var selectedRarity: Rarity?
 
@@ -716,17 +742,18 @@ struct CollectionView: View {
     }
 
     var body: some View {
+        @Bindable var nav = navigation
         if store.dexEntries.isEmpty {
             emptyState   // 둘 다 비어 있으니 세그먼트를 그리지 않는다
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Picker("", selection: $showingLog) {
+                Picker("", selection: $nav.showingCollectionLog) {
                     Text(store.l.dexTitle).tag(false)
                     Text(store.l.catchLogTitle).tag(true)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                if showingLog { catchLog } else { DexGridView(store: store) }
+                if nav.showingCollectionLog { catchLog } else { DexGridView(store: store) }
             }
             .frame(height: Self.contentHeight)
         }
@@ -775,12 +802,38 @@ struct CollectionView: View {
     }
 }
 
+/// 도감 하단의 대표 설정 액션. 문구는 툴팁·접근성에 유지하되 시각적으로는 아이콘만 써서,
+/// 긴 en/es 문구가 선택한 종의 이름·희귀도를 밀어내지 않게 한다.
+@MainActor
+struct RepresentativeFooterButton: View {
+    let localization: L
+    let isRepresentative: Bool
+    let action: () -> Void
+
+    private var title: String {
+        isRepresentative ? localization.representativeFollowCurrent : localization.representativeSet
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: isRepresentative ? "arrow.triangle.2.circlepath" : "star")
+        }
+        .labelStyle(.iconOnly)
+        .help(title)
+        .accessibilityLabel(title)
+        .buttonStyle(.bordered)
+        .controlSize(.mini)
+        .fixedSize()
+    }
+}
+
 /// 도감 — 보유 종만 도감 번호순으로, 한 페이지 24칸(4열×6행) 고정 격자.
 ///
 /// 페이지식이라 ScrollView 를 쓰지 않는다 — 팝오버 재오픈 시 fitting size 가 줄어드는 기존 결함을
 /// 우회(고정 높이 + maxHeight)가 아니라 회피로 피한다. 페이지 크기가 고정이라 모든 칸이 항상
 /// 렌더되므로 지연 격자(LazyVGrid)도 필요 없다 — 평범한 VStack/HStack 으로 동기 렌더한다.
 /// 미보유 종은 아예 그리지 않는다(물음표·실루엣 칸 없음).
+@MainActor
 private struct DexGridView: View {
     let store: CompanionStore
     @State private var selectedRarity: Rarity?
@@ -854,7 +907,9 @@ private struct DexGridView: View {
                         let i = row * Self.columns + col
                         if i < slice.count {
                             let sp = slice[i]
-                            DexSpeciesCell(store: store, species: sp, isSelected: selectedID == sp.id) {
+                            DexSpeciesCell(store: store, species: sp,
+                                           isSelected: selectedID == sp.id,
+                                           isRepresentative: store.representativeSpeciesID == sp.id) {
                                 selectedID = (selectedID == sp.id) ? nil : sp.id
                             }
                             .frame(maxWidth: .infinity)
@@ -879,6 +934,11 @@ private struct DexGridView: View {
                 // 칸은 번호·스프라이트·이름만 보여주므로 희귀도가 선택으로 얻는 정보다.
                 Text("#\(sel.id) \(sel.name) · \(store.l.rarityLabel(sel.rarity))")
                     .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+                let isRepresentative = store.representativeSpeciesID == sel.id
+                RepresentativeFooterButton(localization: store.l,
+                                           isRepresentative: isRepresentative) {
+                    _ = store.setRepresentativeSpeciesID(isRepresentative ? nil : sel.id)
+                }
             }
             Spacer(minLength: 4)
             if pageCount > 1 {
@@ -905,10 +965,12 @@ private struct DexGridView: View {
 
 /// 도감 한 칸 — 도감 번호 + 스프라이트 + 종 이름. 종 정보만 담는다(성격·획득 횟수는 로그의 몫).
 /// 정적 스프라이트만 쓴다(animated 생략) — 한 페이지 24칸을 GIF 로 동시 재생하면 CPU 가 안 된다.
+@MainActor
 private struct DexSpeciesCell: View {
     let store: CompanionStore
     let species: CompanionStore.DexSpecies
     let isSelected: Bool
+    let isRepresentative: Bool
     let onTap: () -> Void
 
     /// 로그(56)보다 작다 — 24칸 격자에 이름까지 담아야 한다. 원본 96×96 픽셀아트를
@@ -951,7 +1013,10 @@ private struct DexSpeciesCell: View {
                 }
             }
             .padding(3)
-            .background(Color.secondary.opacity(isSelected ? 0.16 : 0.06))
+            // 대표 = 영속적인 accent 배경, 방금 클릭한 칸 = 기존 accent 테두리.
+            // 서로 다른 카드여도 같은 강조 두 개가 선택된 것처럼 보이지 않는다.
+            .background(isRepresentative ? Color.accentColor.opacity(0.16)
+                                         : Color.secondary.opacity(isSelected ? 0.16 : 0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay {
                 if isSelected {
@@ -963,12 +1028,32 @@ private struct DexSpeciesCell: View {
         .buttonStyle(.plain)
         .help(tooltip)
         .accessibilityLabel(tooltip)
+        .contextMenu {
+            Button {
+                _ = store.setRepresentativeSpeciesID(isRepresentative ? nil : species.id)
+            } label: {
+                Label(isRepresentative ? store.l.representativeFollowCurrent
+                                       : store.l.representativeSet,
+                      systemImage: isRepresentative ? "arrow.triangle.2.circlepath" : "star")
+            }
+        }
     }
 
     /// material 판 — 어두운 스프라이트 위에서도 읽히게(라이트/다크 자동).
     /// 스프라이트 위 라벨에 이미 쓰는 패턴과 동일.
     private var numberTag: some View {
-        Text("#\(species.id)")
+        HStack(spacing: 2) {
+            Text("#\(species.id)")
+            // 기존 번호 캡슐에 결합해 이로치(우측 상단)·키우는 중(스프라이트 하단)·이름과
+            // 새 자리를 다투지 않는다. 아이콘은 언어에 따라 폭이 달라지지 않고, 의미는 셀의
+            // 현지화된 툴팁·접근성 라벨이 보완한다.
+            if isRepresentative {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 6, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+            }
+        }
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 2)
@@ -993,12 +1078,14 @@ private struct DexSpeciesCell: View {
         var parts = ["#\(species.id) \(species.name)", store.l.rarityLabel(species.rarity)]
         if species.isShiny { parts.append(store.l.dexShinyLabel) }
         if species.isRaising { parts.append(store.l.dexRaising) }
+        if isRepresentative { parts.append(store.l.representativeBadge) }
         return parts.joined(separator: " · ")
     }
 }
 
 /// 포획 로그 한 항목 — 희귀도·성격 헤더 + 진화 체인 스프라이트(각 밑에 종 이름) + 잡은 시각.
 /// 체인 각 종의 이름은 저장분이 있으면 body 에서 즉시(플래시 없음), 없으면(구버전) .task 로 조회 후 백필.
+@MainActor
 private struct DexEntryRow: View {
     let store: CompanionStore
     let entry: DexEntry
