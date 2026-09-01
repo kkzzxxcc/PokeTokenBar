@@ -10,7 +10,7 @@ private func dLine(base: Int, tree: EvoNode, rarity: Rarity) -> EvoLine {
     for id in ids(tree) { names[id] = ["en": "P\(id)", "ko": "포\(id)", "ja": "ポ\(id)"] }
     return EvoLine(baseID: base, tree: tree, rarity: rarity, names: names)
 }
-private let disguiseLine = dLine(base: 1, tree: dNode(1, [dNode(2, [dNode(3)])]), rarity: .common) // 커먼 3형태: 첫 진화 125M
+private let disguiseLine = dLine(base: 1, tree: dNode(1, [dNode(2, [dNode(3)])]), rarity: .common) // 커먼 3형태: 첫 진화 12.5M
 private let prunedDisguiseLine = dLine(base: 206, tree: dNode(206, [dNode(982)]), rarity: .common)
 private let dittoLine = dLine(base: 132, tree: dNode(132), rarity: .rare)                           // 메타몽: rare 단일형태
 private let dNow = Date(timeIntervalSince1970: 1_700_000_000)
@@ -114,8 +114,8 @@ final class DittoRevealTests: XCTestCase {
     /// [트리거 브랜치] 첫 진화 임계에서 진화 대신 메타몽으로 리빌 — 진화 자체를 밟지 않는다.
     func testRevealAtFirstEvolution() async {
         let s = seedDisguise()
-        s.applyUsage(300_000_000)   // 라인 미로딩 중 적립(첫 진화 125M 초과) — 진화/리빌 보류
-        XCTAssertEqual(s.state.active?.usedAtStage, 300_000_000)
+        s.applyUsage(30_000_000)   // 라인 미로딩 중 적립(첫 진화 12.5M 초과) — 진화/리빌 보류
+        XCTAssertEqual(s.state.active?.usedAtStage, 30_000_000)
         XCTAssertEqual(s.currentSpeciesID, 1, "아직 위장체 표시")
         XCTAssertFalse(s.state.active?.dittoRevealed ?? true)
         await drainReveal(s)
@@ -128,7 +128,7 @@ final class DittoRevealTests: XCTestCase {
         XCTAssertEqual(s.state.active?.stageIndex, 0)
         XCTAssertEqual(s.state.active?.pathIDs, [132])
         XCTAssertEqual(s.state.active?.plannedPathIDs, [132])
-        XCTAssertEqual(s.state.active?.usedAtStage, 300_000_000 - 125_000_000, "첫 진화 초과분 이월")
+        XCTAssertEqual(s.state.active?.usedAtStage, 30_000_000 - 12_500_000, "첫 진화 초과분 이월")
         XCTAssertNotNil(s.state.active?.dittoDisguise, "위장 마커 보존")
         XCTAssertEqual(s.celebration, .dittoReveal(shiny: false), "리빌 연출 발화")
     }
@@ -158,7 +158,7 @@ final class DittoRevealTests: XCTestCase {
     func testPrunedLeafDisguiseRevealsBeforeGraduation() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ditto-pruned-\(UUID().uuidString).json")
         let threshold = PokemonBalance.phaseThreshold(rarity: .common, totalForms: 1, stageIndex: 0)
-        XCTAssertEqual(threshold, 750_000_000)
+        XCTAssertEqual(threshold, 75_000_000)
         XCTAssertTrue(prunedDisguiseLine.tree.children.isEmpty, "#982 제거 후 #206은 leaf여야 한다")
         let active = "{\"baseID\":206,\"pathIDs\":[206],\"plannedPathIDs\":[206,982],\"stageIndex\":0,"
             + "\"usedAtStage\":\(threshold),\"rarity\":\"common\",\"totalForms\":2,\"isShiny\":true,"
@@ -239,7 +239,7 @@ final class DittoRevealTests: XCTestCase {
     /// 임계 미달이면 리빌하지 않는다(위장 유지).
     func testNoRevealBelowThreshold() async {
         let s = seedDisguise()
-        s.applyUsage(100_000_000)   // 첫 진화 125M 미달
+        s.applyUsage(10_000_000)   // 첫 진화 12.5M 미달
         await drainReveal(s)        // (드레인해도 리빌 조건 미충족)
         XCTAssertFalse(s.state.active?.dittoRevealed ?? true, "임계 미달 → 위장 유지")
         XCTAssertEqual(s.currentSpeciesID, 1, "여전히 위장체")

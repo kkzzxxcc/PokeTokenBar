@@ -80,7 +80,7 @@ final class ShopTests: XCTestCase {
 
     /// 잔액 부족이면 no-op — 인벤토리·지출 원장 불변, false 반환.
     func testBuyInsufficientIsNoOp() {
-        let s = store(used: 400_000_000)
+        let s = store(used: 40_000_000)
         XCTAssertFalse(s.buyRareCandy())
         XCTAssertEqual(s.rareCandyCount, 0)
         XCTAssertEqual(s.state.spentTokens, 0)
@@ -88,13 +88,13 @@ final class ShopTests: XCTestCase {
 
     /// 여러 번 구매하면 잔액이 바닥날 때까지만 성공(가드가 매번 재평가).
     func testMultipleBuysUntilBroke() {
-        let s = store(used: 1_200_000_000)          // 2개까지 가능(1B), 3번째 실패(잔액 200M)
+        let s = store(used: 120_000_000)          // 2개까지 가능(100M), 3번째 실패(잔액 20M)
         XCTAssertTrue(s.buyRareCandy())
         XCTAssertTrue(s.buyRareCandy())
         XCTAssertFalse(s.buyRareCandy())
         XCTAssertEqual(s.rareCandyCount, 2)
         XCTAssertEqual(s.state.spentTokens, 2 * RareCandy.price)
-        XCTAssertEqual(s.availableTokens, 200_000_000)
+        XCTAssertEqual(s.availableTokens, 20_000_000)
     }
 
     /// 구매는 이미 가진 사탕에 합산된다(무료 지급분과 같은 인벤토리).
