@@ -774,3 +774,11 @@ Legacy difficulty migration preserves the fraction representable by integer cred
 not an ideal fraction lost before serialization at tiny historical difficulty values.
 The private install helper keeps rollback bundles and does not access Keychain or invoke
 manual signing; verify the installed process after running it.
+
+## Initial settings navigation and native focus
+
+Initial session-key navigation must scroll without animation before assigning focus.
+Animating ScrollViewReader movement while the native secure field acquires focus can
+leave the field outside the viewport on macOS. The existing rendered viewport test
+reproduced the failure; remove only the initial animation, retaining expansion, focus,
+and the four difficulty/display controls. Include field and host geometry on failure.

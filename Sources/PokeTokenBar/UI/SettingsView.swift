@@ -87,9 +87,9 @@ struct SettingsView: View {
                         advancedExpanded = true
                         Task { @MainActor in
                             try? await Task.sleep(nanoseconds: 80_000_000)
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                proxy.scrollTo("advancedSettingsSection", anchor: .top)
-                            }
+                            // Initial navigation must finish before focusing the native field.
+                            // Animating both operations can leave it outside the viewport.
+                            proxy.scrollTo("advancedSettingsSection", anchor: .top)
                             sessionKeyFocused = true
                         }
                     }
