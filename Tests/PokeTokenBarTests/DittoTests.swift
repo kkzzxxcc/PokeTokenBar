@@ -321,6 +321,94 @@ final class DittoRevealTests: XCTestCase {
         XCTAssertEqual(s.currentSpeciesID, 1, "여전히 위장체")
     }
 
+    func testCandyPickerMatchesApparentPokemonButOnlySpendsEnoughToReveal() async throws {
+        let s = seedDisguise(usedAtStage: 10_000_000)
+        await drainReveal(s)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("normal-candy-\(UUID()).json")
+        let normal = CompanionStore(provider: DittoTestProvider(), clock: { dNow }, fileURL: url,
+                                    dittoDisguiseRollingEnabled: false)
+        await normal.hatch(baseID: 1)
+        normal.applyUsage(10_000_000)
+        for store in [s, normal] {
+            store.grantCandies(from: [], limitsReady: true)
+            store.grantCandies(from: [CandyWindow(key: "batch.weekly", name: "Test", kind: .weekly,
+                                                 utilization: 100)], limitsReady: true)
+        }
+        XCTAssertEqual(s.maxRareCandyUseCount, normal.maxRareCandyUseCount)
+        for count in 1...5 {
+            let disguised = try XCTUnwrap(s.planRareCandyUse(count: count))
+            let apparent = try XCTUnwrap(normal.planRareCandyUse(count: count))
+            XCTAssertEqual(disguised.count, apparent.count)
+            XCTAssertEqual(disguised.xp, apparent.xp)
+            XCTAssertEqual(disguised.evolves, apparent.evolves)
+            XCTAssertEqual(disguised.graduates, apparent.graduates)
+            XCTAssertEqual(disguised.carryoverXP, apparent.carryoverXP)
+            XCTAssertEqual(disguised.discardedXP, apparent.discardedXP)
+        }
+        _ = s.useRareCandy(count: 5)
+        XCTAssertEqual(s.rareCandyCount, 4)
+        XCTAssertEqual(s.candyFeedbackAmount, RareCandy.xp)
+        XCTAssertEqual(s.useRareCandy(count: 5), .unavailable, "Do not spend while the reveal is pending")
+        await drainReveal(s)
+        XCTAssertEqual(s.currentSpeciesID, PokemonOdds.dittoSpeciesID)
+        XCTAssertEqual(s.state.active?.usedAtStage, 97_500_000)
+        XCTAssertEqual(s.maxRareCandyUseCount, 3)
+        XCTAssertEqual(s.useRareCandy(count: 2), .progressed)
+        XCTAssertEqual(s.state.active?.usedAtStage, 297_500_000)
+        XCTAssertEqual(s.rareCandyCount, 2)
+    }
+
+    func testApparentGraduationBatchPreservesUnusedCandiesAtDittoReveal() async throws {
+        for difficulty in [0.1, 1.0, 2.0] {
+            for boosted in [false, true] {
+                let suiteName = "ditto-candy-\(UUID())"
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+                defer { defaults.removePersistentDomain(forName: suiteName) }
+                defaults.set(difficulty, forKey: "growthDifficulty")
+                let s = seedDisguise(boosted: boosted, defaults: defaults)
+                await drainReveal(s)
+                s.grantCandies(from: [], limitsReady: true)
+                for i in 0..<4 {
+                    s.grantCandies(from: [CandyWindow(key: "batch.\(i)", name: "Test", kind: .weekly,
+                                                     utilization: 100)], limitsReady: true)
+                }
+                let revealThreshold = s.threshold
+                let preview = try XCTUnwrap(s.planRareCandyUse(count: 20))
+                XCTAssertTrue(preview.graduates, "Preview must use the apparent path")
+                let consumed = (revealThreshold + RareCandy.xp - 1) / RareCandy.xp
+                _ = s.useRareCandy(count: 20)
+                await drainReveal(s)
+                let carryover = consumed * RareCandy.xp - revealThreshold
+                let finalThreshold = PokemonBalance.scaled(PokemonBalance.phaseThreshold(
+                    rarity: .rare, totalForms: 1, stageIndex: 0,
+                    growthMultiplier: boosted ? PokemonBalance.repeatGrowthMultiplier : 1), by: difficulty)
+                if carryover >= finalThreshold {
+                    XCTAssertNil(s.state.active)
+                    XCTAssertEqual(s.state.dex.last?.baseID, PokemonOdds.dittoSpeciesID)
+                } else {
+                    XCTAssertEqual(s.currentSpeciesID, PokemonOdds.dittoSpeciesID)
+                    XCTAssertEqual(s.state.active?.usedAtStage, carryover)
+                }
+                XCTAssertEqual(s.candyFeedbackAmount, consumed * RareCandy.xp)
+                XCTAssertEqual(s.rareCandyCount, 20 - consumed)
+                XCTAssertEqual(s.state.dex.isEmpty, carryover < finalThreshold)
+            }
+        }
+    }
+
+    func testCandyBatchCarriesOverflowAtReveal() async throws {
+        let s = seedDisguise(usedAtStage: 0)
+        await drainReveal(s)
+        s.grantCandies(from: [], limitsReady: true)
+        s.grantCandies(from: [CandyWindow(key: "batch.exact", name: "Test", kind: .weekly,
+                                         utilization: 100)], limitsReady: true)
+        _ = s.useRareCandy(count: 5)
+        await drainReveal(s)
+        XCTAssertEqual(s.currentSpeciesID, PokemonOdds.dittoSpeciesID)
+        XCTAssertEqual(s.state.active?.usedAtStage, 87_500_000)
+        XCTAssertEqual(s.rareCandyCount, 4)
+    }
+
     /// 구버전 저장(ditto 필드 없음) → nil/false, 일반 포켓몬으로 동작(이로치는 그대로 표시).
     func testBackwardCompatDecodeNoDittoFields() {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ditto-bc-\(UUID().uuidString).json")
