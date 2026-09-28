@@ -71,9 +71,9 @@ PokeTokenBar는 당신이 이미 태우고 있는 AI 코딩 토큰(Claude Code �
 <tr>
 <td width="55%" valign="middle">
 <h3>채우고 싶어지는 도감</h3>
-<b>도감</b>은 보유한 종을 한 칸으로 접어 도감 번호순으로 보여줍니다 — 한 페이지 24칸, 이로치로 잡은 종에는 ✨가 붙어요. <b>포획 로그</b>는 개체를 그대로 남깁니다: 최신순으로 전체 진화 라인·희귀도·성격·획득일까지.
+<b>도감</b>은 보유한 종을 한 칸으로 접어 도감 번호순으로 보여줍니다 — 이미지와 이름을 키운 4×4 배치로 한 페이지 16칸, 이로치로 잡은 종에는 ✨가 붙어요. 두 화면 모두 이름·번호 검색, 희귀도·이로치 필터와 정렬을 지원합니다. <b>포획 로그</b>는 개체를 그대로 남깁니다: 최신순으로 전체 진화 라인·희귀도·성격·획득일까지.
 </td>
-<td width="45%" align="center"><img src="assets/screenshot-collection-pokedex.png" width="300" alt="도감 — 종 하나가 한 칸"><br><br><img src="assets/screenshot-collection-catchlog.png" width="300" alt="포획 로그 — 키운 개체 하나가 한 행"></td>
+<td width="45%" align="center"><img src="assets/screenshot-collection-pokedex-ko.png" width="300" alt="도감 — 종 하나가 한 칸"><br><br><img src="assets/screenshot-collection-catchlog-ko.png" width="300" alt="포획 로그 — 키운 개체 하나가 한 행"></td>
 </tr>
 <tr>
 <td width="45%" align="center"><img src="assets/settings-ko.png" width="300" alt="설정"></td>
@@ -168,6 +168,13 @@ Pi는 모델 여러 개를 세션 로그 하나로 흘려보낼 수 있습니다
 - **소진 예측** — 현재 5시간 창이 100%에 도달할 시각 예측.
 - **인앱 업데이트** — 원클릭 업데이트 확인, 설정에 현재 버전 표시.
 - **사용량 돌아보기** — 주·월·연 단위로 지난 기간까지 넘겨 보는 포켓몬 도감 스타일 요약(합계·게이지·이전 기간과 비교(진행 중이면 같은 일수끼리)·최고의 날·최장 연속·졸업). 기록은 올해와 작년분을 로컬에 보관.
+
+- **로컬 저장 백업** — 자동 스냅샷과 손상 복구를 지원하며 설정에서 이전 저장 상태를 복원할 수 있습니다.
+- **안농 폼 수집** — 28종 문자 폼을 수집하고 도감에서 보유한 폼을 확인하세요.
+- **이상한 사탕 일괄 사용** — 여러 사탕을 한 번에 사용하고, 사용 전 성장 결과를 미리 볼 수 있습니다.
+- **한도 사용 페이스** — 게이지의 경과 시간 표식과 6단계 색상으로 사용 속도를 확인합니다. 메뉴바 한도 비율도 같은 색상을 사용합니다.
+
+<img src="assets/screenshot-usage-recap-ko.png" width="360" alt="선택한 기간의 사용량 돌아보기">
 
 ## 지원 도구
 
