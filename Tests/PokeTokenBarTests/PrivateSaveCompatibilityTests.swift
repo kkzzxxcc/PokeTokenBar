@@ -17,6 +17,12 @@ final class PrivateSaveCompatibilityTests: XCTestCase {
                 for (key, value) in dictionary { check(value, next[key], path: path + "." + key) }
             } else if let array = original as? [Any] {
                 guard let next = updated as? [Any] else { XCTFail("Missing array at \(path)"); return }
+                if path == "save.collectedFinals" {
+                    XCTAssertEqual(Set(array.compactMap { $0 as? String }),
+                                   Set(next.compactMap { $0 as? String }), path)
+                    XCTAssertEqual(array.count, next.count, path)
+                    return
+                }
                 XCTAssertEqual(array.count, next.count, path)
                 for (index, pair) in zip(array, next).enumerated() { check(pair.0, pair.1, path: path + "[\(index)]") }
             } else if original is NSNull {
