@@ -44,6 +44,25 @@ read_when:
 
 ## 판정·데이터
 
+- **Cursor usage and limits must share the refreshed login, with cookie and Bearer forms kept
+  distinct.** Usage reread the expired SQLite access token on every poll while limits refreshed
+  only its private local variable. This left limits working beside frozen/cached usage. A browser
+  `CURSOR_SESSION_TOKEN` cookie also became an invalid `Bearer user::jwt` in the limits request.
+  The old HTTP test copied the request into `TestCursorLimitsProvider`, bypassing the production
+  credential selection and refresh branches. `CursorAuthentication` now pairs access/refresh from
+  one selected database root, shares refreshed credentials in memory, and normalizes raw or
+  percent-encoded browser cookies for Bearer requests. Explicit overrides never refresh a local
+  account. Root/access/refresh/override/logout changes discard refreshed state; a rotated refresh
+  token survives transient grants in memory without rewriting Cursor's database. Both fetchers
+  retry only 401/403 once, retaining existing non-auth failure/cache semantics. The class sweep
+  covered both Cursor callers, Stable/Nightly/custom roots, grant ownership and the live-network
+  gate. Two production-path synthetic reproducers failed before the fix (usage remained on the
+  old token after a successful limits refresh; limits sent the entire cookie as Bearer).
+  The initial 13 production regression tests passed; the final 15 `CursorAuthenticationTests`
+  cover recovery in both call orders, cookie encodings, account/root
+  invalidation, local-root pairing, override isolation, grant failure/retry/rotation, bounded
+  retries and the live grant gate. `CursorLimitsTests` now calls the real provider.
+
 - **A model-price test needs an independent bucket-level oracle.** Sonnet 5.5 copied Sonnet 5's
   cache-read rate ($0.20/MTok) although its official rate is $0.10; source-unpriced Claude logs
   therefore doubled that bucket's estimate. The standard-row test repeated the wrong literal,
@@ -202,6 +221,13 @@ read_when:
   Session/turn aggregates (Hermes/Aside), Cursor bubbles without cache buckets, and Kiro text
   estimates cannot be passed to request-size-dependent pricing as if they were single requests.
   Parser semantic changes require the corresponding disk-cache version bump.
+
+- **Incremental transcript parsing must retain cumulative ledgers, not add their totals.** Claude's
+  latest `cost-state` reprices the entire session, including entries cached before the appended tail.
+  Keep raw entries and the latest ledger together in the blob, then attribute costs after merging.
+  Retain that ledger when the next tail has none; discard it on a full reparse. Assistant-only append
+  tests miss this semantic conflict with source-cost attribution. `ClaudeReportedCostTests` covers
+  changed totals, unchanged cache hits, disk reload without a new ledger, truncation, and partial ledgers.
 
 - **프로필 레벨은 난이도와 반복 부화 보정을 반영한 단계 진행에서 계산한다.** #244/#254의 임계값을
   낮춰도 #264가 원시 토큰을 기본 졸업 비용으로 나누면 졸업한 개체가 레벨 5 또는 52에 남는다.
@@ -1314,3 +1340,25 @@ as a set plus its element count; keep positional comparisons for ordered `dex` a
 other arrays. The test previously passed only when the set happened to keep its
 serialization order. A sweep of other save round-trip assertions found no other
 set-backed positional JSON comparisons.
+
+- **A wider navigation label must not squeeze numeric period summaries.** Adding the localized
+  recap capsule to the home's fixed-width summary row left too little space for its week/month
+  labels and costs: the real English and German popovers split `$31.64` and `$121.30` across
+  lines. The existing production render used Korean with costs disabled, so it never exercised
+  that combination. Preserve the period totals' intrinsic width and let `ViewThatFits` move
+  the recap button to a trailing row when the inline arrangement does not fit. If the two period
+  groups alone exceed the content width (German `Nicht verfügbar`), stack those groups too;
+  forcing their combined intrinsic width expands and clips the entire popover. The sibling
+  Claude account period row has no recap control and does not share this trigger.
+  `testRecapLabelKeepsPeriodCostsOnOneLine` renders the full production popover in English
+  and German with costs enabled and requires each complete amount in one top-ranked OCR
+  observation. Restoring the previous inline row makes both languages fail; joining OCR
+  observations would conceal the broken digits. `testUnavailablePeriodCostsKeepGermanHomeWithinPopover`
+  also requires the full leading home captions and both unavailable labels, so a clipped
+  popover cannot pass merely because its trailing recap button remains visible.
+  Match OCR recognition languages to each fixture: inheriting Korean for English made CI
+  read `This` as `Thls` despite correct pixels. The period-cost fixtures retain strict labels
+  and complete amounts; the original Korean quiet-day fixtures own the strict chart assertion.
+  On the same CI image, English-only recognition corrected the period label but still read
+  the unrelated chart caption `Daily` as `Dally`; do not teach OCR that misspelling or relax
+  the original chart guard to make a period-row regression pass.
