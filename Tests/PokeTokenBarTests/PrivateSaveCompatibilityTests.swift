@@ -2,6 +2,31 @@ import XCTest
 @testable import PokeTokenBar
 
 final class PrivateSaveCompatibilityTests: XCTestCase {
+    func testPre257SaveDefaultsOnlyTheNewCosmeticFields() throws {
+        let legacy = Data(#"{"usedSinceInstall":123456,"eggUsage":321,"inventory":{"rareCandy":7},"dex":[]}"#.utf8)
+        let state = try JSONDecoder().decode(CompanionState.self, from: legacy)
+        XCTAssertEqual(state.usedSinceInstall, 123456)
+        XCTAssertEqual(state.eggUsage, 321)
+        XCTAssertEqual(state.inventory["rareCandy"], 7)
+        XCTAssertNil(state.eggPrayers)
+        XCTAssertTrue(state.notifiedDexCompletions.isEmpty)
+        XCTAssertFalse(state.dexCompletionsSeeded)
+        let restored = try JSONDecoder().decode(CompanionState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(restored.usedSinceInstall, state.usedSinceInstall)
+        XCTAssertEqual(restored.inventory, state.inventory)
+    }
+
+    func test257CosmeticFieldsSurviveSaveRoundTrip() throws {
+        var state = CompanionState()
+        state.eggPrayers = PrayerRecord(count: 3)
+        state.notifiedDexCompletions = ["region-1"]
+        state.dexCompletionsSeeded = true
+        let restored = try JSONDecoder().decode(CompanionState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(restored.eggPrayers, state.eggPrayers)
+        XCTAssertEqual(restored.notifiedDexCompletions, state.notifiedDexCompletions)
+        XCTAssertTrue(restored.dexCompletionsSeeded)
+    }
+
     func testSnapshotPreservesEveryLegacyField() throws {
         guard let path = ProcessInfo.processInfo.environment["PTB_COMPAT_SNAPSHOT"] else {
             throw XCTSkip("Provide an external save snapshot; never commit user data")
